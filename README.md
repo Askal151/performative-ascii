@@ -42,7 +42,7 @@ Proyek ini terinspirasi dari seni performatif, ritual, dan estetika glitch — m
 
 ---
 
-## 🎮 Kontrol
+##  Kontrol
 
 ### Navigasi Layer
 | Tombol | Fungsi |
@@ -79,7 +79,7 @@ Proyek ini terinspirasi dari seni performatif, ritual, dan estetika glitch — m
 
 ---
 
-## 🛠️ Instalasi & Penggunaan
+## Instalasi & Penggunaan
 
 ### Prasyarat
 - **Go** 1.18+ terinstal
