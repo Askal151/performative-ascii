@@ -142,7 +142,7 @@ var (
 	frame         int
 	selectedLayer = 1
 	selectedParam = 0
-	layers        [14]Layer
+	layers        [16]Layer
 	colorMode     = true
 	globalBright  = 1.0
 	running       = true
@@ -167,6 +167,8 @@ var (
 		"\033[38;5;129m", // 11: Purple
 		"\033[38;5;240m", // 12: Dark Gray
 		"\033[38;5;231m", // 13: Bright White (Particle Wave)
+		"\033[38;5;154m", // 14: Lime Green (Iso Spiked Ball)
+		"\033[38;5;45m",  // 15: Cyan (QR Code Tetris)
 	}
 )
 
@@ -188,6 +190,36 @@ type TypistColumn struct {
 	Offset float64
 	Length int
 }
+
+type SpikeVertex struct {
+	X, Y float64
+	Z    float64
+}
+
+type SpikeEdge struct {
+	A, B int
+}
+
+var (
+	spikeVerts []SpikeVertex
+	spikeEdges []SpikeEdge
+	spikeFrame int
+)
+
+type QRBlock struct {
+	X, Y    int
+	Pattern [][]int // 0=empty, 1=data, 2=finder, 3=timing
+}
+
+var (
+	qrGrid           [][]bool
+	qrBlocks         []QRBlock
+	qrFallTimer      int
+	qrSpawnTimer     int
+	qrScrollTimer    int
+	qrGlitchTimer    int
+	qrGlitchInterval int
+)
 
 // ============================================
 // TERMINAL SIZE
@@ -224,7 +256,7 @@ func easeInOutQuad(t float64) float64 {
 // ============================================
 
 func updateLayerAlphas() {
-	for i := 1; i <= 13; i++ {
+	for i := 1; i <= 15; i++ {
 		// Smoothly interpolate Alpha towards TargetAlpha
 		diff := layers[i].TargetAlpha - layers[i].Alpha
 		
@@ -265,7 +297,7 @@ func updateAutoMode() {
 			// Prepare next cycle
 			transition.CurrentLayer = transition.NextLayer
 			transition.NextLayer = transition.CurrentLayer + 1
-			if transition.NextLayer > 13 {
+			if transition.NextLayer > 15 {
 				transition.NextLayer = 1
 			}
 		}
@@ -292,9 +324,11 @@ func initLayers() {
 		"GLITCH STORM",         // 11
 		"CHAOS ENTROPY",        // 12
 		"PARTICLE WAVE FIELD",  // 13
+		"ISO SPIKED BALL",      // 14
+		"QR CODE TETRIS",       // 15
 	}
 
-	for i := 1; i <= 13; i++ {
+	for i := 1; i <= 15; i++ {
 		layers[i] = Layer{
 			Name:        names[i],
 			Enabled:     false,
@@ -314,6 +348,10 @@ func initLayers() {
 	layers[1].Enabled = true
 	layers[1].Alpha = 1.0
 	layers[1].TargetAlpha = 1.0
+
+	// Override QR Code Tetris defaults: matrix mode
+	layers[15].Params[0].Value = 1.0 // Speed
+	layers[15].Params[1].Value = 1.0 // Density
 	
 	initBalls(60)
 	initTypist(100)
@@ -952,6 +990,383 @@ func renderParticleWaveField(nx, ny, t, density, scale, chaos float64) (float64,
 	return intensity, resultChar
 }
 
+// ============================================
+// ISO SPIKED BALL
+// ============================================
+
+func pointToSegmentDistSq(px, py, ax, ay, bx, by float64) float64 {
+	dx := bx - ax
+	dy := by - ay
+	if dx == 0 && dy == 0 {
+		dx = px - ax
+		dy = py - ay
+		return dx*dx + dy*dy
+	}
+	t := ((px-ax)*dx + (py-ay)*dy) / (dx*dx + dy*dy)
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	cx := ax + t*dx
+	cy := ay + t*dy
+	dx = px - cx
+	dy = py - cy
+	return dx*dx + dy*dy
+}
+
+func updateSpikedBall(t, speed, density, scale, chaos float64) {
+	const isoCa = 0.86602540378 // cos(30°)
+	const isoEa = 0.5           // sin(30°)
+
+	pulse := 1.0 + math.Sin(t*1.5)*0.15
+	spikeAmp := 0.25 + chaos*0.35
+	spikeMod := 1.0 + math.Sin(t*2.1)*0.5
+
+	rotY := t * speed * 0.5
+	caY, saY := math.Cos(rotY), math.Sin(rotY)
+
+	latRes := int(8 + density*6)
+	lonRes := int(10 + density*8)
+	totalVerts := (latRes + 1) * (lonRes + 1)
+
+	spikeVerts = make([]SpikeVertex, totalVerts)
+	spikeEdges = spikeEdges[:0]
+
+	for i := 0; i <= latRes; i++ {
+		theta := math.Pi * float64(i) / float64(latRes)
+		st, ct := math.Sin(theta), math.Cos(theta)
+		for j := 0; j <= lonRes; j++ {
+			phi := 2 * math.Pi * float64(j) / float64(lonRes)
+			sp, cp := math.Sin(phi), math.Cos(phi)
+
+			bx := st * cp
+			by := ct
+			bz := st * sp
+
+			spike := noise2D(bx*2+float64(i)*0.3, bz*2+float64(j)*0.2) * spikeAmp * spikeMod
+			spike += math.Sin(theta*6+phi*5+t*2) * 0.08 * chaos
+
+			r := 0.55 * pulse * scale * (1.0 + spike)
+
+			x3 := bx * r
+			y3 := by * r
+			z3 := bz * r
+
+			// Rotate around Y axis
+			xr := x3*caY + z3*saY
+			zr := -x3*saY + z3*caY
+
+			idx := i*(lonRes+1) + j
+			spikeVerts[idx] = SpikeVertex{
+				X: xr*isoCa - zr*isoCa,
+				Y: xr*isoEa + y3 + zr*isoEa,
+				Z: y3,
+			}
+		}
+	}
+
+	for i := 0; i < latRes; i++ {
+		for j := 0; j < lonRes; j++ {
+			idx := i*(lonRes+1) + j
+			spikeEdges = append(spikeEdges, SpikeEdge{A: idx, B: idx + lonRes + 1})
+			spikeEdges = append(spikeEdges, SpikeEdge{A: idx, B: idx + 1})
+		}
+		last := (i+1)*(lonRes+1) - 1
+		spikeEdges = append(spikeEdges, SpikeEdge{A: last, B: last + lonRes + 1})
+	}
+}
+
+func renderIsoSpikedBall(nx, ny, t, density, scale, chaos float64) float64 {
+	if len(spikeVerts) == 0 {
+		updateSpikedBall(t, 0.5, density, scale, chaos)
+	}
+	threshSq := 0.0009
+	minDistSq := threshSq
+	bestZ := 0.0
+	for _, e := range spikeEdges {
+		a, b := spikeVerts[e.A], spikeVerts[e.B]
+		d := pointToSegmentDistSq(nx, ny, a.X, a.Y, b.X, b.Y)
+		if d < minDistSq {
+			minDistSq = d
+			bestZ = (a.Z + b.Z) * 0.5
+		}
+	}
+	if minDistSq < threshSq {
+		val := 1.0 - math.Sqrt(minDistSq)/0.03
+		shade := 0.4 + 0.6*math.Max(0, math.Min(1, (bestZ+1.5)/3.0))
+		return math.Min(1.0, val) * shade
+	}
+	return 0
+}
+
+// ============================================
+// QR CODE TETRIS
+// ============================================
+
+func generateQRPattern(chaos float64) [][]int {
+	size := 3 + rand.Intn(2)
+	if chaos > 0.3 {
+		size += rand.Intn(2)
+	}
+	pattern := make([][]int, size)
+	for i := range pattern {
+		pattern[i] = make([]int, size)
+		for j := range pattern[i] {
+			if rand.Float64() > 0.45 {
+				pattern[i][j] = 1
+			}
+		}
+	}
+
+	// Finder pattern: top-left
+	for di := 0; di < 3 && di < size; di++ {
+		for dj := 0; dj < 3 && dj < size; dj++ {
+			if di == 1 && dj == 1 {
+				pattern[di][dj] = 0
+			} else {
+				pattern[di][dj] = 2
+			}
+		}
+	}
+	// Finder pattern: top-right
+	for di := 0; di < 3 && di < size; di++ {
+		for dj := size - 3; dj < size; dj++ {
+			if dj < 0 {
+				continue
+			}
+			if di == 1 && dj == size-2 {
+				pattern[di][dj] = 0
+			} else {
+				pattern[di][dj] = 2
+			}
+		}
+	}
+	// Finder pattern: bottom-left
+	for di := size - 3; di < size; di++ {
+		for dj := 0; dj < 3 && dj < size; dj++ {
+			if di < 0 {
+				continue
+			}
+			if di == size-2 && dj == 1 {
+				pattern[di][dj] = 0
+			} else {
+				pattern[di][dj] = 2
+			}
+		}
+	}
+
+	// Timing patterns between finders
+	for j := 3; j < size-3; j++ {
+		if j%2 == 0 {
+			pattern[2][j] = 3
+			if size-4 >= 0 {
+				pattern[size-3][j] = 3
+			}
+		}
+	}
+	for i := 3; i < size-3; i++ {
+		if i%2 == 0 {
+			pattern[i][2] = 3
+			if size-4 >= 0 {
+				pattern[i][size-3] = 3
+			}
+		}
+	}
+
+	return pattern
+}
+
+func canPlace(x, y int, p [][]int, grid [][]bool, gridH int) bool {
+	if y+len(p) > gridH {
+		return false
+	}
+	for i := range p {
+		for j := range p[i] {
+			if p[i][j] == 0 {
+				continue
+			}
+			cx := x + j
+			cy := y + i
+			if cx < 0 || cx >= len(grid[0]) {
+				return false
+			}
+			if cy < 0 {
+				continue
+			}
+			if grid[cy][cx] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func lockBlock(b QRBlock, grid [][]bool) {
+	for i := range b.Pattern {
+		for j := range b.Pattern[i] {
+			if b.Pattern[i][j] == 0 {
+				continue
+			}
+			cy := b.Y + i
+			cx := b.X + j
+			if cy >= 0 && cy < len(grid) && cx >= 0 && cx < len(grid[0]) {
+				grid[cy][cx] = true
+			}
+		}
+	}
+}
+
+func clearFullRows(grid [][]bool) int {
+	cleared := 0
+	for y := len(grid) - 1; y >= 0; y-- {
+		full := true
+		for x := range grid[y] {
+			if !grid[y][x] {
+				full = false
+				break
+			}
+		}
+		if full {
+			for yy := y; yy > 0; yy-- {
+				copy(grid[yy], grid[yy-1])
+			}
+			for x := range grid[0] {
+				grid[0][x] = false
+			}
+			cleared++
+			y++
+		}
+	}
+	return cleared
+}
+
+func spawnQRBlock(width int, chaos float64) {
+	pattern := generateQRPattern(chaos)
+	maxX := width - len(pattern[0])
+	if maxX < 0 {
+		maxX = 0
+	}
+	x := rand.Intn(maxX + 1)
+	yOff := -len(pattern) - rand.Intn(5)
+	qrBlocks = append(qrBlocks, QRBlock{X: x, Y: yOff, Pattern: pattern})
+}
+
+func updateQRCodeRain(enabled bool, t, speed, density, chaos float64, width, height int) {
+	if len(qrGrid) != height || (height > 0 && len(qrGrid[0]) != width) {
+		qrGrid = make([][]bool, height)
+		for i := range qrGrid {
+			qrGrid[i] = make([]bool, width)
+		}
+		qrBlocks = nil
+		qrFallTimer = 0
+		qrSpawnTimer = 0
+		qrScrollTimer = 0
+		qrGlitchTimer = 0
+		qrGlitchInterval = 0
+	}
+
+	if !enabled {
+		return
+	}
+
+	// Periodic glitch: every ~10s (250 frames), glitch for ~5s (125 frames)
+	qrGlitchInterval++
+	if qrGlitchTimer > 0 {
+		qrGlitchTimer--
+		if qrGlitchTimer == 0 {
+			qrGlitchInterval = 0
+		}
+	} else if qrGlitchInterval >= 250 {
+		qrGlitchTimer = 125
+		qrGlitchInterval = 0
+	}
+
+	// Scroll grid downward slowly — creates circular flow
+	scrollInterval := int(2 + (1.0-chaos)*6.0)
+	qrScrollTimer++
+	if qrScrollTimer >= scrollInterval {
+		qrScrollTimer = 0
+		for y := height - 1; y > 0; y-- {
+			copy(qrGrid[y], qrGrid[y-1])
+		}
+		for x := range qrGrid[0] {
+			qrGrid[0][x] = false
+		}
+	}
+
+	fallInterval := int(1 + (1.0-speed)*2.0)
+	qrFallTimer++
+	if qrFallTimer >= fallInterval {
+		qrFallTimer = 0
+
+		lockedCount := 0
+		for i := 0; i < len(qrBlocks); i++ {
+			b := &qrBlocks[i]
+			if canPlace(b.X, b.Y+1, b.Pattern, qrGrid, height) {
+				b.Y++
+			} else {
+				lockBlock(*b, qrGrid)
+				qrBlocks = append(qrBlocks[:i], qrBlocks[i+1:]...)
+				i--
+				lockedCount++
+			}
+		}
+
+		clearFullRows(qrGrid)
+	}
+
+	spawnCount := 1 + int(density*2)
+	qrSpawnTimer++
+	if qrSpawnTimer >= 1 {
+		qrSpawnTimer = 0
+		for s := 0; s < spawnCount; s++ {
+			spawnQRBlock(width, chaos)
+		}
+	}
+}
+
+var glitchChars = []string{"╬", "╳", "#", "!", "?", "▓", "▒", "░", "▀", "▄", "█"}
+
+func renderQRCodeRain(nx, ny, t, density, scale, chaos float64, width, height int) (float64, string) {
+	aspect := float64(width) / float64(height) * 0.5
+	col := int((nx/aspect + 1.0) * float64(width) * 0.5)
+	row := int((ny + 1.0) * float64(height) * 0.5)
+
+	if col < 0 || col >= width || row < 0 || row >= height {
+		return 0, " "
+	}
+
+	if qrGlitchTimer > 0 && rand.Float64() < 0.06 {
+		return 1.0, glitchChars[rand.Intn(len(glitchChars))]
+	}
+
+	if len(qrGrid) > 0 && row < len(qrGrid) && qrGrid[row][col] {
+		if qrGlitchTimer > 0 && rand.Float64() < 0.1 {
+			return 0.5, "░"
+		}
+		return 0.7, "▒"
+	}
+
+	for _, b := range qrBlocks {
+		if row >= b.Y && row < b.Y+len(b.Pattern) &&
+			col >= b.X && col < b.X+len(b.Pattern[0]) {
+			pr := row - b.Y
+			pc := col - b.X
+			switch b.Pattern[pr][pc] {
+			case 2:
+				return 1.0, "█"
+			case 3:
+				return 0.8, "▓"
+			case 1:
+				return 0.5, "▒"
+			}
+		}
+	}
+
+	return 0, " "
+}
+
 func updateBalls(speed float64) {
 	for i := range balls {
 		balls[i].X += balls[i].VX * speed * 2
@@ -993,7 +1408,6 @@ func render() {
 	if layers[2].Alpha > 0.01 {
 		updateBalls(layers[2].Params[0].Value)
 	}
-
 	// UI dimensions
 	boxW := 30
 	boxH := 11
@@ -1002,6 +1416,11 @@ func render() {
 
 	renderH := height - 3
 	t := float64(frame) * 0.1
+
+	if layers[14].Alpha > 0.01 {
+		updateSpikedBall(t, layers[14].Params[0].Value, layers[14].Params[1].Value, layers[14].Params[3].Value+0.5, layers[14].Params[4].Value)
+	}
+	updateQRCodeRain(layers[15].Enabled, t, layers[15].Params[0].Value, layers[15].Params[1].Value, layers[15].Params[4].Value, width, renderH)
 
 	for y := 0; y < renderH; y++ {
 		for x := 0; x < width; x++ {
@@ -1130,7 +1549,7 @@ func render() {
 				maxContrib := 0.0
 				specialChar := ""
 
-				for lIdx := 1; lIdx <= 13; lIdx++ {
+				for lIdx := 1; lIdx <= 15; lIdx++ {
 					lyr := layers[lIdx]
 					
 					// Skip if alpha is essentially zero
@@ -1187,6 +1606,12 @@ func render() {
 						val = renderChaosEntropy(nx, ny, lt, density, scale, chaos)
 					case 13:
 						v, c := renderParticleWaveField(nx, ny, lt, density, scale, chaos)
+						val = v
+						tempChar = c
+					case 14:
+						val = renderIsoSpikedBall(nx, ny, lt, density, scale, chaos)
+					case 15:
+						v, c := renderQRCodeRain(nx, ny, lt, density, scale, chaos, width, renderH)
 						val = v
 						tempChar = c
 					}
@@ -1252,12 +1677,12 @@ func render() {
 	// Layer selector
 	output.WriteString("\n\n")
 
-	spacing := width / 14
+	spacing := width / 16
 	if spacing < 4 {
 		spacing = 4
 	}
 
-	for i := 1; i <= 13; i++ {
+	for i := 1; i <= 15; i++ {
 		if i == 1 {
 			output.WriteString(strings.Repeat(" ", spacing/2))
 		} else {
@@ -1279,6 +1704,10 @@ func render() {
 			displayNum = "="
 		} else if i == 13 {
 			displayNum = "+"
+		} else if i == 14 {
+			displayNum = "Z"
+		} else if i == 15 {
+			displayNum = "T"
 		}
 
 		alpha := layers[i].Alpha
@@ -1341,7 +1770,7 @@ func handleInput() {
 			transition.AutoMode = !transition.AutoMode
 			if transition.AutoMode {
 				// Reset all layers
-				for i := 1; i <= 13; i++ {
+				for i := 1; i <= 15; i++ {
 					layers[i].Alpha = 0
 					layers[i].TargetAlpha = 0
 					layers[i].Enabled = false
@@ -1349,7 +1778,7 @@ func handleInput() {
 				// Start from selected layer
 				transition.CurrentLayer = selectedLayer
 				transition.NextLayer = selectedLayer + 1
-				if transition.NextLayer > 13 {
+				if transition.NextLayer > 15 {
 					transition.NextLayer = 1
 				}
 				layers[transition.CurrentLayer].Alpha = 1
@@ -1369,13 +1798,13 @@ func handleInput() {
 			selectedParam = 0
 			if transition.AutoMode {
 				// Jump to this layer in auto mode
-				for i := 1; i <= 13; i++ {
+				for i := 1; i <= 15; i++ {
 					layers[i].TargetAlpha = 0
 				}
 				layers[newLayer].TargetAlpha = 1
 				transition.CurrentLayer = newLayer
 				transition.NextLayer = newLayer + 1
-				if transition.NextLayer > 13 {
+				if transition.NextLayer > 15 {
 					transition.NextLayer = 1
 				}
 				transition.HoldTimer = 0
@@ -1391,6 +1820,12 @@ func handleInput() {
 			selectedParam = 0
 		case '+':
 			selectedLayer = 13
+			selectedParam = 0
+		case 'z', 'Z':
+			selectedLayer = 14
+			selectedParam = 0
+		case 't', 'T':
+			selectedLayer = 15
 			selectedParam = 0
 		case 'a', 'A':
 			// Same as space - toggle with fade
@@ -1429,7 +1864,7 @@ func handleInput() {
 			}
 		case 'x', 'X':
 			// Solo mode - enable only selected, disable others with fade
-			for i := 1; i <= 13; i++ {
+			for i := 1; i <= 15; i++ {
 				if i == selectedLayer {
 					layers[i].TargetAlpha = 1
 					layers[i].Enabled = true
